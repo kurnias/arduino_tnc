@@ -82,11 +82,14 @@ Version history:
 
 
 #ifdef ARD_DUE
-#define SET_DDRB         (DDRB = 0x3F) 
-#define DCD_ON           (PORTB |=  0x01)
-#define DCD_OFF          (PORTB &= ~0x01)
-#define HB_ON            (PORTB |=  0x02)
-#define HB_OFF           (PORTB &= ~0x02)
+#define SET_DDRB         (DDRB = DAC_MASK)
+/* On ATmega328P builds this port is also used as the TX DAC ladder.
+ * Driving status LEDs on the same bits is unsafe, so make DCD/HB no-ops
+ * unless you reassign them to a separate port. */
+#define DCD_ON           ((void)0)
+#define DCD_OFF          ((void)0)
+#define HB_ON            ((void)0)
+#define HB_OFF           ((void)0)
 #endif
 
 /*#ifdef ARD_MEGA
@@ -104,19 +107,35 @@ Version history:
 #include <avr/sleep.h>
 #include <util/delay.h>
 #include <inttypes.h>
+#include <string.h>
 
 
 // ==== protos
 #ifdef ARD_DUE
-ISR(TIMER1_COMPA_vect) ;
+ISR(TIMER1_COMPA_vect);
 #endif
 
 #ifdef ARD_MEGA
-ISR(TIMER3_COMPA_vect) ;
+ISR(TIMER3_COMPA_vect);
 #endif
 
-void decode_ax25(void) ;
-void send_serial_str( const char * inputstr ) ;
+ISR(TIMER2_OVF_vect);
+ISR(USART_RX_vect);
+
+static inline void Serial_Processes(void);
+static inline void MsgHandler(uint8_t data);
+static void decode_ax25(void);
+static void send_serial_str(const char *inputstr);
+static static void mainTransmit(void);
+static static void mainReceive(void);
+static void mainDelay(uint8_t timeout);
+static static void ax25sendHeader(void);
+static static void ax25sendFooter(void);
+static void ax25sendByte(uint8_t txbyte);
+static void ax25crcBit(uint8_t lsb_int);
+static uint8_t ax25_check_fcs(const uint8_t *data, uint8_t len);
+static inline void write_dac(uint8_t value);
+static inline uint8_t rb_next(uint8_t index);
 
 
 // ==== vars
@@ -159,18 +178,36 @@ uint32_t        bitq ;                     // rec'd bits awaiting grouping into 
 				
 unsigned char   debug = 0 ;                // used while program is compiled in GCC on PC (probably broken)
 
-static char	sine[16] = {58,22,46,30,62,30,46,22,6,42,18,34,2,34,18,42};
-static unsigned char sine_index;		// Index for the D-to-A sequence
-static unsigned char	transmit;			// Keeps track of TX/RX state
-volatile unsigned char	txtone;						// Used in main.c SIGNAL(SIG_OVERFLOW2)
-volatile unsigned char maindelay;		// State of mainDelay function
+static const uint8_t sine[16] = {58,22,46,30,62,30,46,22,6,42,18,34,2,34,18,42};
+static volatile uint8_t sine_index;      // Index for the D-to-A sequence
+static volatile uint8_t transmit;        // Keeps track of TX/RX state
+static volatile uint8_t txtone;          // Current TX tone divider
+static volatile uint8_t maindelay;       // State of mainDelay function
 
-#define	BUF_SIZE		(200)			// Educated guess for a good buffer size
+#define BUF_SIZE        (PACKET_SIZE)
+#define DAC_MASK        (0x3F)
 
-static unsigned char inbuf[PACKET_SIZE + 1];	// USART input buffer array
-static unsigned char inhead;				// USART input buffer head pointer
-static unsigned char intail;				// USART input buffer tail pointer
+static volatile uint8_t inbuf[BUF_SIZE]; // USART input buffer array
+static volatile uint8_t inhead;          // USART input buffer head pointer
+static volatile uint8_t intail;          // USART input buffer tail pointer
+static volatile uint8_t rx_overruns;     // RX bytes dropped because the ring buffer was full
+static uint8_t kiss_in_frame;
+static uint8_t kiss_cmd_seen;
+static uint8_t kiss_escape_pending;
 
+
+
+static inline uint8_t rb_next(uint8_t index)
+{
+    ++index;
+    if (index >= BUF_SIZE) { index = 0; }
+    return index;
+}
+
+static inline void write_dac(uint8_t value)
+{
+    PORTB = (PORTB & (uint8_t)~DAC_MASK) | (value & DAC_MASK);
+}
 
 void setup(void)
 {
@@ -185,7 +222,7 @@ void setup(void)
     UCSR0B |= (1<<RXCIE0); //enable rx interrupt
      
     // ADC (MEGA or Due)
-    ADMUX   = (1<<REFS0) ;                    // channel0, ref to external input (Aref)
+    ADMUX   = (1<<REFS0) ;                    // channel0, AVcc reference with external capacitor on AREF
     ADMUX  |= (1<<ADLAR) ;              // left-justified (only need 8 bits)
     ADCSRA  = (1<<ADPS2) ;              // pre-scale 16
     ADCSRA |= (1<<ADATE) ;              // auto-trigger (free-run)
@@ -270,7 +307,7 @@ ISR(TIMER1_COMPA_vect)
   {
     ++sine_index;				// Increment index
     sine_index &= 15;				// And wrap to a max of 15    
-    PORTB = sine[sine_index];			// Load next D-to-A sinewave value
+    write_dac(sine[sine_index]);         // Load next D-to-A sinewave value safely
     OCR1A = txtone;				// Preload counter based on freq.
   }
   else
@@ -707,9 +744,22 @@ ISR(TIMER1_COMPA_vect)
               { /* printf( "%d (%d): Add byte %02X (len is now %d)\n" , 
   		     sampnum, inaframe, byteval, msg_pos ) ; */ }
   
-              // add it to the incoming message
-              msg[ msg_pos ] = byteval ;
-              msg_pos++ ;
+              // add it to the incoming message, but never overrun the packet buffer
+              if ( msg_pos < PACKET_SIZE )
+              {
+                  msg[ msg_pos ] = byteval ;
+                  msg_pos++ ;
+              }
+              else
+              {
+                  msg_pos = 0 ;
+                  inaframe = 0 ;
+                  bitq = 0 ;
+                  bitqlen = 0 ;
+                  sync_err_cnt = 0 ;
+                  DCD_OFF ;
+                  return ;
+              }
               
               // is this good enough of a KISS frame to turn on the carrier-detect light?
               // we know we have an HDLC (because we're in a frame); 
@@ -741,111 +791,149 @@ ISR(TIMER1_COMPA_vect)
       // debug: check timing
       //end_time = TCNT3 ;
   
-      sei() ;
   }      
       return ;
 }  // end timerX interrupt
 
 /**********************************************************************
-*  Set up a generic timer that we can call (only enabled in transmit mode) 
-*  that we use as a symbol timer so that it ticks at ~1200hz 
+*  Set up a generic timer that we can call (only enabled in transmit mode)
+*  that we use as a symbol timer so that it ticks at ~1200hz
 *
 **********************************************************************/
-SIGNAL(TIMER2_OVF_vect)
+ISR(TIMER2_OVF_vect)
 {
-  //PORTB ^= 0x3C;//sine[sine_index];			// Load next D-to-A sinewave value
-  maindelay = FALSE;					// Clear condition holding up mainDelay
-  TCNT2 = 0;								// Make long as possible delay
-  
-  //test to see if we toggle fast enough....
-  //TCNT2 = 255 - BIT_DELAY;
-  //txtone = (txtone == MARK)? SPACE : MARK;
-  
+  maindelay = FALSE;                     // Clear condition holding up mainDelay
+  TCNT2 = 0;                            // Make delay as long as possible
 }
 
 /******************************************************************************/
-SIGNAL(USART_RX_vect)
+ISR(USART_RX_vect)
 /*******************************************************************************
-* ABSTRACT:	Called by the receive ISR (interrupt). Saves the next serial
-*				byte to the head of the RX buffer.
-*
-* INPUT:		None
-* OUTPUT:	None
-* RETURN:	None
+* ABSTRACT: Called by the receive ISR (interrupt). Saves the next serial
+*           byte to the head of the RX buffer without overwriting unread data.
 */
 {
-	if (++inhead == BUF_SIZE) inhead = 0;	// Advance and wrap buffer pointer
-	inbuf[inhead] = UDR0;	  					// Transfer the byte to the input buffer
-        
-	return;
+    uint8_t next = rb_next(inhead);
+    uint8_t data = UDR0;
 
-}		// End SIGNAL(SIG_UART_RECV)
+    if (next == intail)
+    {
+        rx_overruns++;
+        return;
+    }
+
+    inbuf[next] = data;
+    inhead = next;
+}
 
 /******************************************************************************/
-inline void	Serial_Processes(void)
+static inline void Serial_Processes(void)
 /*******************************************************************************
-* ABSTRACT:	Called by main.c during idle time. Processes any waiting serial
-*				characters coming in or going out both serial ports.
-*
-* INPUT:		None
-* OUTPUT:	None
-* RETURN:	None
+* ABSTRACT: Called by loop() during idle time. Processes waiting serial input.
 */
 {
   PORTD ^= 0x04;
-	if (intail != inhead)					// If there are incoming bytes pending
-	{
-		if (++intail == BUF_SIZE) intail = 0;	// Advance and wrap pointer
-		MsgHandler(inbuf[intail]);		// And pass it to a handler
-	}
-
-	return;
-
-}		// End Serial_Processes(void)
-
-static unsigned char prevdata; 
-/*******************************************************************************
-* MsgHandler(char data) 
-*  Takes in a byte at a time and determins what we should do with it from the 
-*  serial port. This is what translates kiss data and spits it out the modem 
-*  taking care of special characters 
-*
-*******************************************************************************/
-inline void MsgHandler(unsigned char data)
-{
-  
-   if (0xC0 == prevdata)
-   {
-     if ((0x00 == data) )
-     { //we have the start of a new message
-        mainTransmit();
-     }
-     //TODO setup other modem parameters here... such as txtail etc....
-   }
-   else if((0xC0 == data) && (transmit == TRUE))// now we have the end of a message
-   {
-     mainReceive();
-   }
-   else if(0xDC == data) // we may have an escape byte
-   {  
-        if(0xDB == prevdata)
-        {
-            ax25sendByte(0xC0);
-        }
-   }
-   else if(0xDD == data) // we may have an escape byte
-   {
-        if(0xDB == prevdata)
-        {
-            ax25sendByte(0xDB);
-        }
-   }  
-   else if (TRUE == transmit)ax25sendByte(data); // if we are transmitting then just send the data
-  
-  prevdata = data; // copy the data for our state machine 
+  while (intail != inhead)
+  {
+      intail = rb_next(intail);
+      MsgHandler(inbuf[intail]);
+  }
 }
 
-void decode_ax25 (void)
+static uint8_t prevdata;
+/*******************************************************************************
+* MsgHandler(uint8_t data)
+*  Robust KISS parser for one port. Supports FEND/FESC escaping and ignores
+*  unsupported non-data commands instead of accidentally modulating them.
+*******************************************************************************/
+static inline void MsgHandler(uint8_t data)
+{
+  prevdata = data;
+
+  if (data == 0xC0)   // FEND
+  {
+      if (kiss_in_frame && transmit == TRUE)
+      {
+          mainReceive();
+      }
+
+      kiss_in_frame = 1;
+      kiss_cmd_seen = 0;
+      kiss_escape_pending = 0;
+      return;
+  }
+
+  if (!kiss_in_frame)
+  {
+      return;
+  }
+
+  if (!kiss_cmd_seen)
+  {
+      kiss_cmd_seen = 1;
+
+      /* Only command 0x00 (data frame for port 0) is supported here. */
+      if (data == 0x00)
+      {
+          if (transmit != TRUE)
+          {
+              mainTransmit();
+          }
+      }
+      else
+      {
+          kiss_in_frame = 0;
+      }
+      return;
+  }
+
+  if (kiss_escape_pending)
+  {
+      if (data == 0xDC)      { data = 0xC0; }
+      else if (data == 0xDD) { data = 0xDB; }
+      else
+      {
+          kiss_in_frame = 0;
+          kiss_escape_pending = 0;
+          return;
+      }
+      kiss_escape_pending = 0;
+  }
+  else if (data == 0xDB)     // FESC
+  {
+      kiss_escape_pending = 1;
+      return;
+  }
+
+  if (transmit == TRUE)
+  {
+      ax25sendByte(data);
+  }
+}
+static uint8_t ax25_check_fcs(const uint8_t *data, uint8_t len)
+{
+    uint16_t fcs = 0xFFFF;
+    uint8_t i;
+    uint8_t bit;
+
+    if (len < 2) { return FALSE; }
+
+    for (i = 0; i < len; i++)
+    {
+        uint8_t byteval_local = data[i];
+        for (bit = 0; bit < 8; bit++)
+        {
+            uint8_t mix = (fcs ^ byteval_local) & 0x01;
+            fcs >>= 1;
+            if (mix) { fcs ^= 0x8408; }
+            byteval_local >>= 1;
+        }
+    }
+
+    return (fcs == 0xF0B8) ? TRUE : FALSE;
+}
+
+static void decode_ax25 (void)
 {
     // Take the data in the msg array, and send it out the serial port.
   
@@ -853,6 +941,9 @@ void decode_ax25 (void)
     decode_state = 0 ;     // 0=just starting, 1=header, 2=got 0x03, 3=got 0xF0 (payload data)
 
     //debug( "Decode routine - rec'd " . length($pkt) . " bytes." ) ;
+
+    if (msg_pos < 2) { return; }
+    if (!ax25_check_fcs(msg, msg_pos)) { return; }
 
     // lop off last 2 bytes (FCS checksum, which we're not sending to the PC)
     for ( x = 0 ; x < (msg_pos - 2) ; x++ )
@@ -921,7 +1012,7 @@ void decode_ax25 (void)
 }
 
 
-void send_serial_str(const char * inputstr) 
+static void send_serial_str(const char * inputstr) 
 {
     for ( x=0 ; x < strlen( inputstr ) ; x++ ) 
     {
@@ -933,7 +1024,7 @@ void send_serial_str(const char * inputstr)
 
 
 /******************************************************************************/
-void mainTransmit(void)
+static void mainTransmit(void)
 /*******************************************************************************
 * ABSTRACT:	Do all the setup to transmit.
 *
@@ -958,7 +1049,7 @@ void mainTransmit(void)
 
 
 /******************************************************************************/
-void mainReceive(void)
+static void mainReceive(void)
 /*******************************************************************************
 * ABSTRACT:	Do all the setup to receive or wait.
 *
@@ -969,7 +1060,7 @@ void mainReceive(void)
 {
 	ax25sendFooter();		// Send APRS footer
 	transmit = FALSE;		// Disable transmitter
-	PORTB &= 0x00;			// Make sure the transmitter is disabled by turning off transmit pin was 0x3D to turn off ptt
+	write_dac(0);			// Stop driving the DAC ladder without clobbering unrelated PORTB bits
         TCCR1B = (1<<WGM12) | (1<<CS10) ;
         TIMSK2 &= ~(1<<TOIE2); //disable timer two interrupt 
         OCR1A = T3TOP ;      //set timer 1 back to triggering at the recieve sample frequency 
@@ -980,7 +1071,7 @@ void mainReceive(void)
 
 
 /******************************************************************************/
-void mainDelay(unsigned char timeout)
+static void mainDelay(uint8_t timeout)
 /*******************************************************************************
 * ABSTRACT:	This function sets "maindelay", programs the desired delay,
 *			
@@ -1006,7 +1097,7 @@ void mainDelay(unsigned char timeout)
 static unsigned short	crc;
 
 /******************************************************************************/
-void ax25sendHeader(void)
+static void ax25sendHeader(void)
 /*******************************************************************************
 * ABSTRACT:	This function keys the transmitter, sends the source and
 *				destination address, and gets ready to send the actual data.
@@ -1028,7 +1119,7 @@ void ax25sendHeader(void)
 }		// End ax25sendHeader(void)
 
 /******************************************************************************/
-void ax25sendFooter(void)
+static void ax25sendFooter(void)
 /*******************************************************************************
 * ABSTRACT:	This function closes out the packet with the check-sum and a
 *				final flag.
@@ -1046,7 +1137,7 @@ void ax25sendFooter(void)
 	return;
 }		// End ax25sendFooter(void)
 /******************************************************************************/
-void ax25sendByte(unsigned char txbyte)
+static void ax25sendByte(uint8_t txbyte)
 /*******************************************************************************
 * ABSTRACT:	This function sends one byte by toggling the "tone" variable.
 *
@@ -1055,10 +1146,10 @@ void ax25sendByte(unsigned char txbyte)
 * RETURN:	None
 */
 {
-	static char	mloop;
-	static char	bitbyte;
-	static int	bit_zero;
-	static unsigned char	sequential_ones;
+	uint8_t	mloop;
+	uint8_t	bitbyte;
+	uint8_t	bit_zero;
+	static uint8_t	sequential_ones;
 
 	bitbyte = txbyte;							// Bitbyte will be rotated through
 
@@ -1098,7 +1189,7 @@ void ax25sendByte(unsigned char txbyte)
 	return;
 }		// End ax25sendByte(unsigned char txbyte)
 /*******************************************************************************/
-void ax25crcBit(int lsb_int)
+static void ax25crcBit(uint8_t lsb_int)
 /*******************************************************************************
 * ABSTRACT:	This function takes the latest transmit bit and modifies the crc.
 *
